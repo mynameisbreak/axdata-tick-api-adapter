@@ -32,8 +32,6 @@
 ### 快速启动
 
 
-  <strong>开源量化数据库框架</strong>
-</p>
 
 <p align="center">
   <a href="https://electkismet.github.io/AxData/"><strong>在线文档</strong></a>

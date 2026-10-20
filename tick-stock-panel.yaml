@@ -1,0 +1,102 @@
+# tick-stock-panel 自定义数据源配置文件
+# 规范参考: https://github.com/shy3130/tick-stock-panel/blob/main/docs/custom-data-source.md
+# 用法: 在 tick-stock-panel 的自定义数据源设置中导入本文件
+# 注意: 将 host 替换为实际部署 AxData API 的服务器地址
+
+name: axdata_tick_adapter
+display_name: "AxData tick adapter（axdata-tick-api-adapter）"
+auth:
+  type: none
+
+datasets:
+  realtime:
+    url: http://122.51.191.216:8666/tick/realtime
+    method: GET
+    rpm: 60
+    timeout: 30
+    response_path: data
+    pct_unit: decimal
+    field_map:
+      symbol: symbol
+      last_price: last_price
+      prev_close: pre_close
+      open: open
+      high: high
+      low: low
+      volume: volume
+      amount: amount
+      change_pct: change_pct
+
+  minute:
+    url: http://122.51.191.216:8666/tick/minute
+    method: GET
+    rpm: 60
+    timeout: 60
+    response_path: data
+    field_map:
+      symbol: symbol
+      datetime: tick_time
+      price: price
+      volume: volume
+      prev_price: prev_price
+      trade_type: trade_type
+
+  full_minute:
+    url: http://122.51.191.216:8666/tick/minute
+    method: GET
+    rpm: 30
+    timeout: 60
+    response_path: data
+    params:
+      full: "true"
+    field_map:
+      symbol: symbol
+      datetime: tick_time
+      price: price
+      volume: volume
+      prev_price: prev_price
+      trade_type: trade_type
+
+  daily:
+    url: http://122.51.191.216:8666/tick/daily
+    method: GET
+    rpm: 30
+    timeout: 60
+    response_path: data
+    field_map:
+      symbol: ts_code
+      trade_date: trade_date
+      open: open
+      high: high
+      low: low
+      close: close
+      pre_close: pre_close
+      volume: vol
+      amount: amount
+      change_pct: pct_chg
+      change: change
+
+  adj_factor:
+    url: http://122.51.191.216:8666/tick/adj_factor
+    method: GET
+    rpm: 30
+    timeout: 60
+    response_path: data
+    field_map:
+      symbol: ts_code
+      trade_date: trade_date
+      adj_factor: adj_factor
+
+  financial:
+    url: http://122.51.191.216:8666/tick/financial
+    method: GET
+    rpm: 10
+    timeout: 60
+    response_path: data
+    field_map:
+      symbol: symbol
+      statement_type: statement_type
+      statement_name: statement_name
+      report_date: report_date
+      item_name: item_name
+      item_value: item_value
