@@ -48,7 +48,7 @@ def test_workspace_package_is_metadata_only() -> None:
 
     assert pyproject["build-system"]["requires"] == ["setuptools>=77"]
     assert pyproject["build-system"]["build-backend"] == "setuptools.build_meta"
-    assert pyproject["project"]["license"] == "Apache-2.0"
+    assert pyproject["project"]["license"] == {"file": "LICENSE"}
     assert pyproject["tool"]["setuptools"]["packages"] == []
 
 
