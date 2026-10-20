@@ -489,8 +489,15 @@ def financial_batch(request: FinancialRequest):
                 params["report_type"] = request.report_type
             try:
                 result = client.call("stock_financial_report_sina", **params)
-            except TypeError:
-                # 上游接口不接受 report_type 参数时降级为全量查询
+            except Exception as report_type_exc:
+                if not request.report_type:
+                    raise
+                # 上游接口不接受 report_type 参数或该报表类型不可用时，
+                # 降级为不带 report_type 的全量查询
+                logger.warning(
+                    "financial report_type=%s failed for %s (%s), fallback to full query",
+                    request.report_type, symbol, report_type_exc,
+                )
                 params.pop("report_type", None)
                 result = client.call("stock_financial_report_sina", **params)
             data.extend(_normalize(result))
