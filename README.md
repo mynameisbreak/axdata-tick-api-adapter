@@ -31,6 +31,54 @@
 
 ### 快速启动
 
+```bash
+# 启动 API（端口 8666，含 /tick/* 路由）
+python3 -m uvicorn apps.api.main:app --host 0.0.0.0 --port 8666
+
+# 启动 Web 控制台（端口 8667）
+cd apps/web && npm run dev
+```
+
+验证端点：
+
+```bash
+curl http://127.0.0.1:8666/tick/health
+# {"status":"ok","backend":"axdata-sdk","provider":"axdata-tick-adapter"}
+```
+
+### tick-stock-panel 自定义数据源配置
+
+本仓库提供 [`tick-stock-panel.yaml`](./tick-stock-panel.yaml)，符合 [tick-stock-panel 自定义数据源规范](https://github.com/shy3130/tick-stock-panel/blob/main/docs/custom-data-source.md)。接口形态对齐 [eltdx-tick-adapter](https://github.com/mynameisbreak/eltdx-tick-adapter)：`realtime` 为 GET 全市场快照，其余为 POST 批量端点（`symbols` + `start_time`/`end_time`）。
+
+**使用步骤**：
+
+1. 下载本仓库的 `tick-stock-panel.yaml`；
+2. 放到 tick-stock-panel 的 `data/data_sources/` 目录（Docker 部署时对应容器内 `/app/data/data_sources/`）；
+3. 在面板『设置 → 数据源』点击『重新加载』；
+4. 按需将文件中 `url` 的 host 替换为实际部署地址。
+
+**配置覆盖的数据集**（全部 7 个）：
+
+| 数据集 | 端点 | 方式 | 说明 |
+|--------|------|------|------|
+| `realtime` | `/tick/realtime` | GET 全市场快照 | stock_basic 全代码 + 逐标的快照聚合 |
+| `daily` | `/tick/daily` | POST 批量 | 逐标的查询后按日期区间过滤 |
+| `adj_factor` | `/tick/adj_factor` | POST 批量 | 复权因子 |
+| `minute` | `/tick/minute` | POST 批量 | 分时数据聚合为 1 分钟 OHLC |
+| `full_minute` | `/tick/full_minute` | POST 批量 | 同 minute |
+| `financial` | `/tick/financial` | POST 批量 | 财务报表 |
+| `depth5` | `/tick/depth5` | POST 批量 | 快照买一/卖一档组装 asks/bids（AxData 快照无二至五档） |
+
+**部署前校验与标准部署流程**：
+
+- 配置校验脚本：`python3 scripts/validate_panel_config.py tick-stock-panel.yaml`（内置面板必填字段规则，部署前预检，避免校验静默失败）
+- AI 部署提示词：[`docs/deploy-ai-prompt.md`](./docs/deploy-ai-prompt.md)（标准部署步骤与验证命令，可直接投喂 AI 助手执行部署）
+
+---
+
+## 附：上游 AxData 项目说明
+
+
 
   ·
   <a href="https://electkismet.github.io/AxData/interfaces/">接口一览</a>
