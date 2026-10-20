@@ -33,7 +33,7 @@ def _discover_data_root() -> str | None:
         if candidate and Path(candidate).is_dir():
             return candidate
     # 回退到项目内 data 目录
-    project_data = Path(__file__).resolve().parents[3] / "data"
+    project_data = Path(__file__).resolve().parents[2] / "data"
     if project_data.is_dir():
         return str(project_data)
     return None
@@ -114,6 +114,7 @@ async def realtime(
             fields=_parse_fields(fields)
             or [
                 "instrument_id",
+                "symbol",
                 "last_price",
                 "open",
                 "high",
@@ -311,7 +312,7 @@ async def stock_basic(
                 fields=_parse_fields(fields) or default_fields,
             )
         else:
-            result = _get_client().stock_basic(
+            result = _get_client().stock_basic_exchange(
                 fields=_parse_fields(fields) or default_fields,
             )
         return _ok(_normalize(result))
