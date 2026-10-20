@@ -1,6 +1,37 @@
-<h1 align="center">AxData</h1>
+<h1 align="center">axdata-tick-api-adapter</h1>
 
 <p align="center">
+  <strong>基于 AxData 的 Tick Stock Panel 行情适配器</strong>
+</p>
+
+<p align="center">
+  <a href="https://github.com/mynameisbreak/axdata-tick-api-adapter"><img alt="GitHub" src="https://img.shields.io/badge/GitHub-axdata--tick--api--adapter-0969da"></a>
+  <a href="https://github.com/electkismet/AxData"><img alt="Upstream AxData" src="https://img.shields.io/badge/上游-AxData-2ea043"></a>
+  <img alt="Python 3.11+" src="https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white">
+  <a href="./LICENSE"><img alt="Research-Only" src="https://img.shields.io/badge/协议-Research--Only-6f42c1"></a>
+</p>
+
+## 项目简介
+
+**axdata-tick-api-adapter** 在 AxData API 服务中嵌入 `/tick/*` 路由，为 [tick-stock-panel](https://github.com/waditu/tick-stock-panel) 提供兼容的行情数据接口。所有数据通过 `AxDataClient` 本地模式直接读取 AxData 数据目录，无需独立部署额外服务。
+
+### 端点一览
+
+| 端点 | 方法 | 说明 | 数据源 |
+|------|------|------|--------|
+| `/tick/health` | GET | 健康检查 | — |
+| `/tick/realtime` | GET | 实时行情快照 | `stock_realtime_snapshot_tdx` |
+| `/tick/daily` | GET | 日 K 线 | AxData `daily` 核心表 |
+| `/tick/minute` | GET | 分时逐笔数据 | `stock_intraday_sina` |
+| `/tick/adj_factor` | GET | 复权因子 | AxData `adj_factor` 核心表 |
+| `/tick/depth5` | GET | 盘口深度（买一/卖一） | `stock_realtime_snapshot_tdx` |
+| `/tick/financial` | GET | 财务报表 | `stock_financial_report_sina` |
+| `/tick/trade_cal` | GET | 交易日历 | AxData `trade_cal` 核心表 |
+| `/tick/stock_basic` | GET | 股票基础信息 | AxData `stock_basic_exchange` 核心表 |
+
+### 快速启动
+
+
   <strong>开源量化数据库框架</strong>
 </p>
 
