@@ -25,27 +25,27 @@ import os
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
+from threading import Condition
 from typing import Any
+from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, Query
-from pydantic import BaseModel
+from axdata_core.source_errors import SourceRequestValidationError
+from fastapi import APIRouter, HTTPException, Query
+from pydantic import BaseModel, Field, model_validator
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/tick", tags=["tick-adapter"])
 
-# 批量端点与全市场快照并行拉取的线程数。
-# 注意：全市场模式（5000+ 标的）逐标的快照仍可能超过面板 60s timeout，
-# 扩容到全市场前需要上游提供批量快照接口或引入本地快照缓存。
 _SNAPSHOT_WORKERS = 16
-
-# ── 懒加载 AxDataClient ──────────────────────────────────────
+_MAX_BATCH_SYMBOLS = 100
+_INTRADAY_PAGE_SIZE = 60
+_MAX_INTRADAY_PAGES = 200
 
 _client: Any = None
 
 
 def _discover_data_root() -> str | None:
-    """按优先级发现 AxData 数据目录。"""
     for candidate in [
         os.environ.get("AXDATA_DATA_DIR"),
         os.environ.get("AXDATA_DATA_ROOT"),
@@ -70,9 +70,6 @@ def _get_client() -> Any:
             data_root or "default",
         )
     return _client
-
-
-# ── 响应格式与工具 ───────────────────────────────────────────
 
 
 def _ok(data: Any) -> dict[str, Any]:
@@ -108,22 +105,12 @@ def _parse_fields(raw: str | None) -> list[str] | None:
 
 
 def _normalize_code(code: str) -> str:
-    """裸代码自动补全交易所后缀：6 开头 → .SH，其余 → .SZ。
-
-    已知限制（面向 A 股股票面板够用）：
-    - 北交所代码（8/4 开头，应为 .BJ）会被误判为 .SZ；
-    - 基金（5 开头，应为 .SH）会被误判为 .SZ；
-    - 上证指数（如 000001.SH）与深市股票（000001.SZ）前缀重叠，
-      裸代码无法区分，一律按深市股票处理。
-    调用方如需精确控制，请直接传入带后缀的完整代码。
-    """
     if "." in code:
         return code
     return f"{code}.SH" if code.startswith("6") else f"{code}.SZ"
 
 
 def _normalize_date(value: str) -> str:
-    """兼容 YYYY-MM-DD / YYYYMMDD / YYYYMMDDHHMM，统一转为 YYYYMMDD。"""
     v = value.replace("-", "").replace("/", "").strip()
     return v[:8] if len(v) >= 8 else v
 
@@ -132,8 +119,15 @@ def _date_text(value: datetime | None) -> str | None:
     return value.strftime("%Y%m%d") if value else None
 
 
+def _validate_batch_size(request: BatchRequest) -> None:
+    if len(request.symbols) > _MAX_BATCH_SYMBOLS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"symbols cannot contain more than {_MAX_BATCH_SYMBOLS} entries",
+        )
+
+
 def _batch_error(symbols: list[str], failed: list[str]) -> dict[str, Any] | None:
-    """全部标的失败时生成 error 汇总，避免静默返回空列表。"""
     if failed and len(failed) == len(symbols) and symbols:
         preview = ", ".join(failed[:5])
         more = f" ...等 {len(failed)} 个" if len(failed) > 5 else ""
@@ -148,10 +142,6 @@ def _batch_error(symbols: list[str], failed: list[str]) -> dict[str, Any] | None
 def _run_parallel(
     symbols: list[str], fetch_one
 ) -> tuple[list[dict[str, Any]], list[str]]:
-    """并行执行逐标的抓取，返回 (data, failed)。
-
-    单标的失败不影响整体，与 realtime 端点一致的容错语义。
-    """
     data: list[dict[str, Any]] = []
     failed: list[str] = []
     with ThreadPoolExecutor(max_workers=_SNAPSHOT_WORKERS) as pool:
@@ -167,20 +157,20 @@ def _run_parallel(
     return data, failed
 
 
-# ── 批量请求模型 ─────────────────────────────────────────────
-
-
 class BatchRequest(BaseModel):
-    symbols: list[str]
+    symbols: list[str] = Field(min_length=1, max_length=_MAX_BATCH_SYMBOLS)
     start_time: datetime | None = None
     end_time: datetime | None = None
+
+    @model_validator(mode="after")
+    def validate_time_range(self):
+        if self.start_time and self.end_time and self.start_time > self.end_time:
+            raise ValueError("start_time must be before or equal to end_time")
+        return self
 
 
 class FinancialRequest(BatchRequest):
     report_type: str | None = None
-
-
-# ── 健康检查 ─────────────────────────────────────────────────
 
 
 @router.get("/health")
@@ -191,8 +181,6 @@ async def health():
         "provider": "axdata-tick-adapter",
     }
 
-
-# ── 实时行情（全市场快照，面板契约） ────────────────────────
 
 _REALTIME_FIELDS = [
     "instrument_id",
@@ -220,7 +208,6 @@ def _snapshot_one(client: Any, code: str) -> list[dict[str, Any]]:
 
 
 def _realtime_rows(client: Any, codes: list[str]) -> list[dict[str, Any]]:
-    """并行拉取多标的快照；单标的失败不影响整体。"""
     data: list[dict[str, Any]] = []
     with ThreadPoolExecutor(max_workers=_SNAPSHOT_WORKERS) as pool:
         futures = {
@@ -251,22 +238,23 @@ def realtime(
             return _ok(_normalize(result))
         if symbols:
             codes = [c.strip() for c in symbols.split(",") if c.strip()]
+            if len(codes) > _MAX_BATCH_SYMBOLS:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"symbols cannot contain more than {_MAX_BATCH_SYMBOLS} entries",
+                )
         else:
             basics = _normalize(
                 client.stock_basic_exchange(fields=["instrument_id"])
             )
-            codes = [
-                row["instrument_id"]
-                for row in basics
-                if row.get("instrument_id")
-            ]
+            codes = [row["instrument_id"] for row in basics if row.get("instrument_id")]
         return _ok(_realtime_rows(client, codes))
-    except Exception as e:
+    except HTTPException:
+        raise
+    except Exception as exc:
         logger.exception("tick adapter realtime failed")
-        return {"data": [], "error": str(e)}
+        return {"data": [], "error": str(exc)}
 
-
-# ── 日 K 线 ──────────────────────────────────────────────────
 
 _DAILY_FIELDS = [
     "ts_code",
@@ -283,10 +271,11 @@ _DAILY_FIELDS = [
 
 @router.post("/daily")
 def daily_batch(request: BatchRequest):
-    """批量日 K：日期区间下推给 AxData 查询，减少传输与内存开销。"""
+    _validate_batch_size(request)
     client = _get_client()
     start_s = _date_text(request.start_time)
     end_s = _date_text(request.end_time)
+
     def fetch_one(symbol: str) -> list[dict[str, Any]]:
         params: dict[str, Any] = {
             "ts_code": _normalize_code(symbol),
@@ -319,28 +308,65 @@ def daily(
             fields=_parse_fields(fields) or _DAILY_FIELDS, **params
         )
         return _ok(_normalize(result))
-    except Exception as e:
+    except Exception as exc:
         logger.exception("tick adapter daily failed")
-        return {"data": [], "error": str(e)}
+        return {"data": [], "error": str(exc)}
 
 
-# ── 分钟 K 线（分时数据聚合为 1m OHLC） ─────────────────────
+def _parse_minute_bound(value: str, *, end_of_minute: bool) -> str | None:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        for fmt in ("%Y%m%d%H%M", "%Y%m%d", "%Y-%m-%d", "%Y/%m/%d"):
+            try:
+                parsed = datetime.strptime(value, fmt)
+                break
+            except ValueError:
+                continue
+        else:
+            return None
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(ZoneInfo("Asia/Shanghai"))
+    if end_of_minute and parsed.hour == 0 and parsed.minute == 0 and len(value) <= 10:
+        parsed = parsed.replace(hour=23, minute=59)
+    return parsed.strftime("%Y-%m-%d %H:%M")
 
 
 def _minute_key(tick: dict[str, Any], date_str: str) -> str | None:
-    """从分时记录提取 YYYYMMDDHHMM 键。"""
     raw = str(tick.get("tick_time") or tick.get("time") or "")
     if not raw:
         return None
     digits = "".join(ch for ch in raw if ch.isdigit())
     if len(digits) >= 14:
         return digits[:12]
-    if len(digits) == 6:  # HHMMSS
+    if len(digits) == 6:
         return date_str + digits[:4]
-    if len(digits) == 4:  # HHMM
+    if len(digits) == 4:
         return date_str + digits
-    # 8 位 YYYYMMDD 无时分信息，无法归入分钟桶，跳过（当前数据源不会出现该格式）
     return None
+
+
+def _fetch_intraday_day(client: Any, symbol: str, day: str) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    page = 1
+    while True:
+        page_rows = _normalize(
+            client.call(
+                "stock_intraday_sina",
+                symbol=symbol,
+                date=day,
+                page=page,
+                limit=_INTRADAY_PAGE_SIZE,
+            )
+        )
+        if page_rows and rows and page_rows == rows[-len(page_rows) :]:
+            raise RuntimeError("intraday source repeated a page")
+        rows.extend(page_rows)
+        if len(page_rows) < _INTRADAY_PAGE_SIZE:
+            return rows
+        if page >= _MAX_INTRADAY_PAGES:
+            raise RuntimeError("intraday response exceeded the maximum page count")
+        page += 1
 
 
 def _aggregate_minute_bars(
@@ -361,8 +387,8 @@ def _aggregate_minute_bars(
         bucket["amount"] += float(price) * vol
     bars: list[dict[str, Any]] = []
     for key in sorted(buckets):
-        b = buckets[key]
-        prices = b["prices"]
+        bucket = buckets[key]
+        prices = bucket["prices"]
         bars.append(
             {
                 "symbol": symbol,
@@ -374,14 +400,15 @@ def _aggregate_minute_bars(
                 "high": max(prices),
                 "low": min(prices),
                 "close": prices[-1],
-                "volume": b["volume"],
-                "amount": b["amount"],
+                "volume": bucket["volume"],
+                "amount": bucket["amount"],
             }
         )
     return bars
 
 
 def _minute_batch_impl(request: BatchRequest) -> dict[str, Any]:
+    _validate_batch_size(request)
     client = _get_client()
     date_str = (
         _date_text(request.start_time)
@@ -394,14 +421,19 @@ def _minute_batch_impl(request: BatchRequest) -> dict[str, Any]:
     end_s = (
         request.end_time.strftime("%Y-%m-%d %H:%M") if request.end_time else None
     )
-    # 跨日区间：逐日拉取分时再聚合（上限 40 天，防止误传超长区间）
     dates: list[str] = []
     if request.start_time and request.end_time:
-        d = request.start_time.date()
-        end_d = request.end_time.date()
-        while d <= end_d and len(dates) < 40:
-            dates.append(d.strftime("%Y%m%d"))
-            d += timedelta(days=1)
+        start_day = request.start_time.date()
+        end_day = request.end_time.date()
+        if (end_day - start_day).days >= 40:
+            raise HTTPException(
+                status_code=422,
+                detail="minute range cannot exceed 40 calendar days",
+            )
+        dates = [
+            (start_day + timedelta(days=offset)).strftime("%Y%m%d")
+            for offset in range((end_day - start_day).days + 1)
+        ]
     if not dates:
         dates = [date_str]
 
@@ -409,8 +441,8 @@ def _minute_batch_impl(request: BatchRequest) -> dict[str, Any]:
         bare = symbol.split(".")[0]
         bars: list[dict[str, Any]] = []
         for day in dates:
-            result = client.call("stock_intraday_sina", symbol=bare, date=day)
-            bars.extend(_aggregate_minute_bars(_normalize(result), symbol, day))
+            rows = _fetch_intraday_day(client, bare, day)
+            bars.extend(_aggregate_minute_bars(rows, symbol, day))
         return [
             bar
             for bar in bars
@@ -441,32 +473,68 @@ def minute(
     fields: str | None = Query(None, description="字段列表"),
     full: bool = Query(default=False, description="全量返回"),
 ):
+    if period != "1m":
+        raise HTTPException(status_code=422, detail="period must be 1m")
+    if len(code) > 32:
+        raise HTTPException(status_code=422, detail="code is too long")
     try:
         symbol = code.split(".")[0] if "." in code else code
-        date_str = _normalize_date(start)
-        result = _get_client().call(
-            "stock_intraday_sina", symbol=symbol, date=date_str
-        )
-        data = _aggregate_minute_bars(_normalize(result), code, date_str)
-        if end:
-            end_s = _normalize_date(end)
-            data = [b for b in data if b["datetime"][:10].replace("-", "") <= end_s]
+        start_s = _parse_minute_bound(start, end_of_minute=False)
+        end_s = _parse_minute_bound(end, end_of_minute=True)
+        if start_s is None or end_s is None:
+            raise HTTPException(
+                status_code=422,
+                detail="start and end must include a valid date",
+            )
+        if start_s > end_s:
+            raise HTTPException(status_code=422, detail="start must be before or equal to end")
+        date_str = start_s[:10].replace("-", "")
+        dates = [date_str]
+        if start_s[:10] != end_s[:10]:
+            start_day = datetime.strptime(start_s[:10], "%Y-%m-%d").date()
+            end_day = datetime.strptime(end_s[:10], "%Y-%m-%d").date()
+            if (end_day - start_day).days >= 40:
+                raise HTTPException(
+                    status_code=422,
+                    detail="minute range cannot exceed 40 calendar days",
+                )
+            dates = [
+                (start_day + timedelta(days=offset)).strftime("%Y%m%d")
+                for offset in range((end_day - start_day).days + 1)
+            ]
+        client = _get_client()
+        data = []
+        for day in dates:
+            ticks = _fetch_intraday_day(client, symbol, day)
+            data.extend(_aggregate_minute_bars(ticks, code, day))
+        data = [
+            bar
+            for bar in data
+            if bar["datetime"][:16] >= start_s and bar["datetime"][:16] <= end_s
+        ]
         if not full and len(data) > 800:
             data = data[:800]
+        if fields:
+            selected = set(_parse_fields(fields) or [])
+            data = [
+                {key: value for key, value in row.items() if key in selected}
+                for row in data
+            ]
         return _ok(data)
-    except Exception as e:
+    except HTTPException:
+        raise
+    except Exception as exc:
         logger.exception("tick adapter minute failed")
-        return {"data": [], "error": str(e)}
-
-
-# ── 复权因子 ─────────────────────────────────────────────────
+        return {"data": [], "error": str(exc)}
 
 
 @router.post("/adj_factor")
 def adj_factor_batch(request: BatchRequest):
+    _validate_batch_size(request)
     client = _get_client()
     start_s = _date_text(request.start_time)
     end_s = _date_text(request.end_time)
+
     def fetch_one(symbol: str) -> list[dict[str, Any]]:
         params: dict[str, Any] = {"ts_code": _normalize_code(symbol)}
         if start_s:
@@ -493,41 +561,60 @@ def adj_factor(
             params["end"] = _normalize_date(end)
         result = _get_client().adj_factor(**params)
         return _ok(_normalize(result))
-    except Exception as e:
+    except Exception as exc:
         logger.exception("tick adapter adj_factor failed")
-        return {"data": [], "error": str(e)}
-
-
-# ── 财务报表 ─────────────────────────────────────────────────
+        return {"data": [], "error": str(exc)}
 
 
 @router.post("/financial")
 def financial_batch(request: FinancialRequest):
-    """批量财务报表；report_type 透传给上游，上游不支持时自动降级。"""
+    _validate_batch_size(request)
     client = _get_client()
-    # 首次降级后记住该 report_type 不被上游支持，后续标的直接走全量查询，
-    # 避免每个标的都先失败一次再降级。
-    report_type_unsupported = False
+    report_type_state = {"status": "unknown"}
+    report_type_condition = Condition()
 
     def fetch_one(symbol: str) -> list[dict[str, Any]]:
-        nonlocal report_type_unsupported
         params: dict[str, Any] = {"stock": _normalize_code(symbol)}
-        if request.report_type and not report_type_unsupported:
-            params["report_type"] = request.report_type
-        try:
+        if not request.report_type:
             return _normalize(client.call("stock_financial_report_sina", **params))
-        except Exception as report_type_exc:
-            if not request.report_type or report_type_unsupported:
-                raise
-            # 上游接口不接受 report_type 参数或该报表类型不可用时，
-            # 降级为不带 report_type 的全量查询
+        with report_type_condition:
+            while report_type_state["status"] == "checking":
+                report_type_condition.wait()
+            if report_type_state["status"] == "unsupported":
+                use_report_type = False
+            else:
+                report_type_state["status"] = "checking"
+                use_report_type = True
+        if not use_report_type:
+            return _normalize(client.call("stock_financial_report_sina", **params))
+        try:
+            result = _normalize(
+                client.call(
+                    "stock_financial_report_sina",
+                    **params,
+                    report_type=request.report_type,
+                )
+            )
+        except SourceRequestValidationError as report_type_exc:
             logger.warning(
                 "financial report_type=%s failed for %s (%s), fallback to full query",
-                request.report_type, symbol, report_type_exc,
+                request.report_type,
+                symbol,
+                report_type_exc,
             )
-            report_type_unsupported = True
-            params.pop("report_type", None)
+            with report_type_condition:
+                report_type_state["status"] = "unsupported"
+                report_type_condition.notify_all()
             return _normalize(client.call("stock_financial_report_sina", **params))
+        except Exception:
+            with report_type_condition:
+                report_type_state["status"] = "unknown"
+                report_type_condition.notify_all()
+            raise
+        with report_type_condition:
+            report_type_state["status"] = "supported"
+            report_type_condition.notify_all()
+        return result
 
     data, failed = _run_parallel(request.symbols, fetch_one)
     return _batch_error(request.symbols, failed) or _ok(data)
@@ -544,17 +631,14 @@ def financial(
         if result is None:
             return {"data": [], "error": "no financial data available"}
         return _ok(_normalize(result))
-    except Exception as e:
+    except Exception as exc:
         logger.exception("tick adapter financial failed")
-        return {"data": [], "error": str(e)}
-
-
-# ── 盘口深度 ─────────────────────────────────────────────────
+        return {"data": [], "error": str(exc)}
 
 
 @router.post("/depth5")
 def depth5_batch(request: BatchRequest):
-    """批量盘口：AxData 快照仅含买一/卖一档。"""
+    _validate_batch_size(request)
     client = _get_client()
 
     def fetch_one(symbol: str) -> list[dict[str, Any]]:
@@ -625,12 +709,9 @@ def depth5(
             ],
         }
         return _ok(depth)
-    except Exception as e:
+    except Exception as exc:
         logger.exception("tick adapter depth5 failed")
-        return {"data": [], "error": str(e)}
-
-
-# ── 交易日历 ─────────────────────────────────────────────────
+        return {"data": [], "error": str(exc)}
 
 
 @router.get("/trade_cal")
@@ -646,12 +727,9 @@ def trade_cal(
             end=_normalize_date(end) if end else None,
         )
         return _ok(_normalize(result))
-    except Exception as e:
+    except Exception as exc:
         logger.exception("tick adapter trade_cal failed")
-        return {"data": [], "error": str(e)}
-
-
-# ── 股票基础信息 ─────────────────────────────────────────────
+        return {"data": [], "error": str(exc)}
 
 
 @router.get("/stock_basic")
@@ -676,6 +754,6 @@ def stock_basic(
                 fields=_parse_fields(fields) or default_fields,
             )
         return _ok(_normalize(result))
-    except Exception as e:
+    except Exception as exc:
         logger.exception("tick adapter stock_basic failed")
-        return {"data": [], "error": str(e)}
+        return {"data": [], "error": str(exc)}
