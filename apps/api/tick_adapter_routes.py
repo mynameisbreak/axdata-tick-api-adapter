@@ -158,12 +158,13 @@ async def daily(
     try:
         params: dict[str, Any] = {"ts_code": _normalize_code(code)}
         if start:
-            params["start"] = start
+            params["start"] = _normalize_date(start)
         if end:
-            params["end"] = end
+            params["end"] = _normalize_date(end)
         result = _get_client().daily(
             fields=_parse_fields(fields)
             or [
+                "ts_code",
                 "trade_date",
                 "open",
                 "high",
@@ -223,9 +224,9 @@ async def adj_factor(
     try:
         params: dict[str, Any] = {"ts_code": _normalize_code(code)}
         if start:
-            params["start"] = start
+            params["start"] = _normalize_date(start)
         if end:
-            params["end"] = end
+            params["end"] = _normalize_date(end)
         result = _get_client().adj_factor(**params)
         return _ok(_normalize(result))
     except Exception as e:
