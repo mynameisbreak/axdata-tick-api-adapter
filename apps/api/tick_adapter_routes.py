@@ -5,12 +5,16 @@
 - GET  /tick/realtime            全市场实时快照（面板契约要求）
 - POST /tick/daily               批量日 K（symbols + start_time/end_time）
 - POST /tick/adj_factor          批量复权因子
-- POST /tick/financial           批量财务报表
+- POST /tick/financial           批量财务报表（支持 report_type）
 - POST /tick/minute              批量分钟 K（分时数据聚合为 1m OHLC）
 - POST /tick/full_minute         同 minute
 - POST /tick/depth5              批量盘口（快照买一/卖一档）
 - GET  单代码查询保留作调试用途
-响应统一为 {"data": [...]}。
+
+响应统一为 {"data": [...]}；批量接口全部失败时附加 error 汇总。
+
+注意：所有含同步阻塞调用的端点均声明为 def（非 async def），
+由 FastAPI 自动放入线程池执行，避免阻塞事件循环。
 """
 
 from __future__ import annotations
@@ -18,6 +22,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -28,6 +33,9 @@ from pydantic import BaseModel
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/tick", tags=["tick-adapter"])
+
+# 全市场快照并行拉取的线程数
+_SNAPSHOT_WORKERS = 8
 
 # ── 懒加载 AxDataClient ──────────────────────────────────────
 
@@ -64,6 +72,7 @@ def _get_client() -> Any:
 
 # ── 响应格式与工具 ───────────────────────────────────────────
 
+
 def _ok(data: Any) -> dict[str, Any]:
     return {"data": data if data is not None else []}
 
@@ -97,7 +106,15 @@ def _parse_fields(raw: str | None) -> list[str] | None:
 
 
 def _normalize_code(code: str) -> str:
-    """裸代码自动补全交易所后缀：6 开头 → .SH，其余 → .SZ。"""
+    """裸代码自动补全交易所后缀：6 开头 → .SH，其余 → .SZ。
+
+    已知限制（面向 A 股股票面板够用）：
+    - 北交所代码（8/4 开头，应为 .BJ）会被误判为 .SZ；
+    - 基金（5 开头，应为 .SH）会被误判为 .SZ；
+    - 上证指数（如 000001.SH）与深市股票（000001.SZ）前缀重叠，
+      裸代码无法区分，一律按深市股票处理。
+    调用方如需精确控制，请直接传入带后缀的完整代码。
+    """
     if "." in code:
         return code
     return f"{code}.SH" if code.startswith("6") else f"{code}.SZ"
@@ -111,6 +128,18 @@ def _normalize_date(value: str) -> str:
 
 def _date_text(value: datetime | None) -> str | None:
     return value.strftime("%Y%m%d") if value else None
+
+
+def _batch_error(symbols: list[str], failed: list[str]) -> dict[str, Any] | None:
+    """全部标的失败时生成 error 汇总，避免静默返回空列表。"""
+    if failed and len(failed) == len(symbols) and symbols:
+        preview = ", ".join(failed[:5])
+        more = f" ...等 {len(failed)} 个" if len(failed) > 5 else ""
+        return {
+            "data": [],
+            "error": f"all {len(failed)} symbols failed: {preview}{more}",
+        }
+    return None
 
 
 # ── 批量请求模型 ─────────────────────────────────────────────
@@ -156,23 +185,32 @@ _REALTIME_FIELDS = [
 ]
 
 
+def _snapshot_one(client: Any, code: str) -> list[dict[str, Any]]:
+    result = client.call(
+        "stock_realtime_snapshot_tdx",
+        code=_normalize_code(code),
+        fields=_REALTIME_FIELDS,
+    )
+    return _normalize(result)
+
+
 def _realtime_rows(client: Any, codes: list[str]) -> list[dict[str, Any]]:
+    """并行拉取多标的快照；单标的失败不影响整体。"""
     data: list[dict[str, Any]] = []
-    for code in codes:
-        try:
-            result = client.call(
-                "stock_realtime_snapshot_tdx",
-                code=_normalize_code(code),
-                fields=_REALTIME_FIELDS,
-            )
-            data.extend(_normalize(result))
-        except Exception as exc:  # 单标的失败不影响整体快照
-            logger.warning("realtime snapshot failed for %s: %s", code, exc)
+    with ThreadPoolExecutor(max_workers=_SNAPSHOT_WORKERS) as pool:
+        futures = {
+            pool.submit(_snapshot_one, client, code): code for code in codes
+        }
+        for future, code in futures.items():
+            try:
+                data.extend(future.result())
+            except Exception as exc:
+                logger.warning("realtime snapshot failed for %s: %s", code, exc)
     return data
 
 
 @router.get("/realtime")
-async def realtime(
+def realtime(
     symbols: str | None = Query(default=None, description="可选过滤，逗号分隔；缺省返回全市场快照"),
     code: str | None = Query(default=None, description="单代码查询（调试用途）"),
     fields: str | None = Query(None, description="字段列表，逗号分隔"),
@@ -219,31 +257,33 @@ _DAILY_FIELDS = [
 
 
 @router.post("/daily")
-async def daily_batch(request: BatchRequest):
-    """批量日 K：逐标的查询后按日期区间过滤聚合。"""
+def daily_batch(request: BatchRequest):
+    """批量日 K：日期区间下推给 AxData 查询，减少传输与内存开销。"""
     client = _get_client()
     start_s = _date_text(request.start_time)
     end_s = _date_text(request.end_time)
     data: list[dict[str, Any]] = []
+    failed: list[str] = []
     for symbol in request.symbols:
         try:
-            result = client.daily(
-                ts_code=_normalize_code(symbol), fields=_DAILY_FIELDS
-            )
-            for row in _normalize(result):
-                td = str(row.get("trade_date", ""))
-                if start_s and td < start_s:
-                    continue
-                if end_s and td > end_s:
-                    continue
-                data.append(row)
+            params: dict[str, Any] = {
+                "ts_code": _normalize_code(symbol),
+                "fields": _DAILY_FIELDS,
+            }
+            if start_s:
+                params["start"] = start_s
+            if end_s:
+                params["end"] = end_s
+            result = client.daily(**params)
+            data.extend(_normalize(result))
         except Exception as exc:
+            failed.append(symbol)
             logger.warning("daily failed for %s: %s", symbol, exc)
-    return _ok(data)
+    return _batch_error(request.symbols, failed) or _ok(data)
 
 
 @router.get("/daily")
-async def daily(
+def daily(
     code: str = Query(..., description="股票代码"),
     start: str | None = Query(None, description="起始日期"),
     end: str | None = Query(None, description="截止日期"),
@@ -320,7 +360,7 @@ def _aggregate_minute_bars(
     return bars
 
 
-async def _minute_batch_impl(request: BatchRequest) -> dict[str, Any]:
+def _minute_batch_impl(request: BatchRequest) -> dict[str, Any]:
     client = _get_client()
     date_str = (
         _date_text(request.start_time)
@@ -334,6 +374,7 @@ async def _minute_batch_impl(request: BatchRequest) -> dict[str, Any]:
         request.end_time.strftime("%Y-%m-%d %H:%M") if request.end_time else None
     )
     data: list[dict[str, Any]] = []
+    failed: list[str] = []
     for symbol in request.symbols:
         try:
             bare = symbol.split(".")[0]
@@ -349,22 +390,23 @@ async def _minute_batch_impl(request: BatchRequest) -> dict[str, Any]:
                     continue
                 data.append(bar)
         except Exception as exc:
+            failed.append(symbol)
             logger.warning("minute failed for %s: %s", symbol, exc)
-    return _ok(data)
+    return _batch_error(request.symbols, failed) or _ok(data)
 
 
 @router.post("/minute")
-async def minute_batch(request: BatchRequest):
-    return await _minute_batch_impl(request)
+def minute_batch(request: BatchRequest):
+    return _minute_batch_impl(request)
 
 
 @router.post("/full_minute")
-async def full_minute_batch(request: BatchRequest):
-    return await _minute_batch_impl(request)
+def full_minute_batch(request: BatchRequest):
+    return _minute_batch_impl(request)
 
 
 @router.get("/minute")
-async def minute(
+def minute(
     code: str = Query(..., description="股票代码"),
     start: str = Query(..., description="起始时间"),
     end: str = Query(..., description="截止时间"),
@@ -391,11 +433,12 @@ async def minute(
 
 
 @router.post("/adj_factor")
-async def adj_factor_batch(request: BatchRequest):
+def adj_factor_batch(request: BatchRequest):
     client = _get_client()
     start_s = _date_text(request.start_time)
     end_s = _date_text(request.end_time)
     data: list[dict[str, Any]] = []
+    failed: list[str] = []
     for symbol in request.symbols:
         try:
             params: dict[str, Any] = {"ts_code": _normalize_code(symbol)}
@@ -406,12 +449,13 @@ async def adj_factor_batch(request: BatchRequest):
             result = client.adj_factor(**params)
             data.extend(_normalize(result))
         except Exception as exc:
+            failed.append(symbol)
             logger.warning("adj_factor failed for %s: %s", symbol, exc)
-    return _ok(data)
+    return _batch_error(request.symbols, failed) or _ok(data)
 
 
 @router.get("/adj_factor")
-async def adj_factor(
+def adj_factor(
     code: str = Query(..., description="股票代码"),
     start: str | None = Query(None, description="起始日期"),
     end: str | None = Query(None, description="截止日期"),
@@ -433,22 +477,31 @@ async def adj_factor(
 
 
 @router.post("/financial")
-async def financial_batch(request: FinancialRequest):
+def financial_batch(request: FinancialRequest):
+    """批量财务报表；report_type 透传给上游，上游不支持时自动降级。"""
     client = _get_client()
     data: list[dict[str, Any]] = []
+    failed: list[str] = []
     for symbol in request.symbols:
         try:
-            result = client.call(
-                "stock_financial_report_sina", stock=_normalize_code(symbol)
-            )
+            params: dict[str, Any] = {"stock": _normalize_code(symbol)}
+            if request.report_type:
+                params["report_type"] = request.report_type
+            try:
+                result = client.call("stock_financial_report_sina", **params)
+            except TypeError:
+                # 上游接口不接受 report_type 参数时降级为全量查询
+                params.pop("report_type", None)
+                result = client.call("stock_financial_report_sina", **params)
             data.extend(_normalize(result))
         except Exception as exc:
+            failed.append(symbol)
             logger.warning("financial failed for %s: %s", symbol, exc)
-    return _ok(data)
+    return _batch_error(request.symbols, failed) or _ok(data)
 
 
 @router.get("/financial")
-async def financial(
+def financial(
     code: str = Query(..., description="股票代码"),
 ):
     try:
@@ -467,10 +520,11 @@ async def financial(
 
 
 @router.post("/depth5")
-async def depth5_batch(request: BatchRequest):
+def depth5_batch(request: BatchRequest):
     """批量盘口：AxData 快照仅含买一/卖一档。"""
     client = _get_client()
     data: list[dict[str, Any]] = []
+    failed: list[str] = []
     for symbol in request.symbols:
         try:
             snapshot = client.call(
@@ -506,12 +560,13 @@ async def depth5_batch(request: BatchRequest):
                 }
             )
         except Exception as exc:
+            failed.append(symbol)
             logger.warning("depth5 failed for %s: %s", symbol, exc)
-    return _ok(data)
+    return _batch_error(request.symbols, failed) or _ok(data)
 
 
 @router.get("/depth5")
-async def depth5(
+def depth5(
     code: str = Query(..., description="股票代码"),
 ):
     try:
@@ -549,7 +604,7 @@ async def depth5(
 
 
 @router.get("/trade_cal")
-async def trade_cal(
+def trade_cal(
     exchange: str = Query(default="SSE", description="交易所 SSE/SZSE"),
     start: str | None = Query(None, description="起始日期"),
     end: str | None = Query(None, description="截止日期"),
@@ -566,7 +621,7 @@ async def trade_cal(
 
 
 @router.get("/stock_basic")
-async def stock_basic(
+def stock_basic(
     exchange: str | None = Query(None, description="交易所 SSE/SZSE/BSE"),
     fields: str | None = Query(None, description="字段列表"),
 ):

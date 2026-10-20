@@ -16,7 +16,7 @@ datasets:
     rpm: 60
     timeout: 60
     response_path: data
-    pct_unit: decimal
+    pct_unit: percent
     field_map:
       symbol: symbol
       last_price: last_price
