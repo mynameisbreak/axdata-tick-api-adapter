@@ -23,7 +23,7 @@ import logging
 import math
 import os
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -34,8 +34,10 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/tick", tags=["tick-adapter"])
 
-# 全市场快照并行拉取的线程数
-_SNAPSHOT_WORKERS = 8
+# 批量端点与全市场快照并行拉取的线程数。
+# 注意：全市场模式（5000+ 标的）逐标的快照仍可能超过面板 60s timeout，
+# 扩容到全市场前需要上游提供批量快照接口或引入本地快照缓存。
+_SNAPSHOT_WORKERS = 16
 
 # ── 懒加载 AxDataClient ──────────────────────────────────────
 
@@ -135,11 +137,34 @@ def _batch_error(symbols: list[str], failed: list[str]) -> dict[str, Any] | None
     if failed and len(failed) == len(symbols) and symbols:
         preview = ", ".join(failed[:5])
         more = f" ...等 {len(failed)} 个" if len(failed) > 5 else ""
+        plural = "s" if len(failed) > 1 else ""
         return {
             "data": [],
-            "error": f"all {len(failed)} symbols failed: {preview}{more}",
+            "error": f"all {len(failed)} symbol{plural} failed: {preview}{more}",
         }
     return None
+
+
+def _run_parallel(
+    symbols: list[str], fetch_one
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """并行执行逐标的抓取，返回 (data, failed)。
+
+    单标的失败不影响整体，与 realtime 端点一致的容错语义。
+    """
+    data: list[dict[str, Any]] = []
+    failed: list[str] = []
+    with ThreadPoolExecutor(max_workers=_SNAPSHOT_WORKERS) as pool:
+        futures = {pool.submit(fetch_one, s): s for s in symbols}
+        for future, symbol in futures.items():
+            try:
+                rows = future.result()
+                if rows:
+                    data.extend(rows)
+            except Exception as exc:
+                failed.append(symbol)
+                logger.warning("batch fetch failed for %s: %s", symbol, exc)
+    return data, failed
 
 
 # ── 批量请求模型 ─────────────────────────────────────────────
@@ -262,23 +287,18 @@ def daily_batch(request: BatchRequest):
     client = _get_client()
     start_s = _date_text(request.start_time)
     end_s = _date_text(request.end_time)
-    data: list[dict[str, Any]] = []
-    failed: list[str] = []
-    for symbol in request.symbols:
-        try:
-            params: dict[str, Any] = {
-                "ts_code": _normalize_code(symbol),
-                "fields": _DAILY_FIELDS,
-            }
-            if start_s:
-                params["start"] = start_s
-            if end_s:
-                params["end"] = end_s
-            result = client.daily(**params)
-            data.extend(_normalize(result))
-        except Exception as exc:
-            failed.append(symbol)
-            logger.warning("daily failed for %s: %s", symbol, exc)
+    def fetch_one(symbol: str) -> list[dict[str, Any]]:
+        params: dict[str, Any] = {
+            "ts_code": _normalize_code(symbol),
+            "fields": _DAILY_FIELDS,
+        }
+        if start_s:
+            params["start"] = start_s
+        if end_s:
+            params["end"] = end_s
+        return _normalize(client.daily(**params))
+
+    data, failed = _run_parallel(request.symbols, fetch_one)
     return _batch_error(request.symbols, failed) or _ok(data)
 
 
@@ -319,6 +339,7 @@ def _minute_key(tick: dict[str, Any], date_str: str) -> str | None:
         return date_str + digits[:4]
     if len(digits) == 4:  # HHMM
         return date_str + digits
+    # 8 位 YYYYMMDD 无时分信息，无法归入分钟桶，跳过（当前数据源不会出现该格式）
     return None
 
 
@@ -373,25 +394,31 @@ def _minute_batch_impl(request: BatchRequest) -> dict[str, Any]:
     end_s = (
         request.end_time.strftime("%Y-%m-%d %H:%M") if request.end_time else None
     )
-    data: list[dict[str, Any]] = []
-    failed: list[str] = []
-    for symbol in request.symbols:
-        try:
-            bare = symbol.split(".")[0]
-            result = client.call(
-                "stock_intraday_sina", symbol=bare, date=date_str
-            )
-            bars = _aggregate_minute_bars(_normalize(result), symbol, date_str)
-            for bar in bars:
-                dt = bar["datetime"][:16]
-                if start_s and dt < start_s:
-                    continue
-                if end_s and dt > end_s:
-                    continue
-                data.append(bar)
-        except Exception as exc:
-            failed.append(symbol)
-            logger.warning("minute failed for %s: %s", symbol, exc)
+    # 跨日区间：逐日拉取分时再聚合（上限 40 天，防止误传超长区间）
+    dates: list[str] = []
+    if request.start_time and request.end_time:
+        d = request.start_time.date()
+        end_d = request.end_time.date()
+        while d <= end_d and len(dates) < 40:
+            dates.append(d.strftime("%Y%m%d"))
+            d += timedelta(days=1)
+    if not dates:
+        dates = [date_str]
+
+    def fetch_one(symbol: str) -> list[dict[str, Any]]:
+        bare = symbol.split(".")[0]
+        bars: list[dict[str, Any]] = []
+        for day in dates:
+            result = client.call("stock_intraday_sina", symbol=bare, date=day)
+            bars.extend(_aggregate_minute_bars(_normalize(result), symbol, day))
+        return [
+            bar
+            for bar in bars
+            if (not start_s or bar["datetime"][:16] >= start_s)
+            and (not end_s or bar["datetime"][:16] <= end_s)
+        ]
+
+    data, failed = _run_parallel(request.symbols, fetch_one)
     return _batch_error(request.symbols, failed) or _ok(data)
 
 
@@ -409,8 +436,8 @@ def full_minute_batch(request: BatchRequest):
 def minute(
     code: str = Query(..., description="股票代码"),
     start: str = Query(..., description="起始时间"),
-    end: str = Query(..., description="截止时间"),
-    period: str = Query(default="1m", description="周期"),
+    end: str = Query(..., description="截止日期（用于过滤返回的分钟线）"),
+    period: str = Query(default="1m", description="周期（当前仅支持 1m）"),
     fields: str | None = Query(None, description="字段列表"),
     full: bool = Query(default=False, description="全量返回"),
 ):
@@ -421,6 +448,9 @@ def minute(
             "stock_intraday_sina", symbol=symbol, date=date_str
         )
         data = _aggregate_minute_bars(_normalize(result), code, date_str)
+        if end:
+            end_s = _normalize_date(end)
+            data = [b for b in data if b["datetime"][:10].replace("-", "") <= end_s]
         if not full and len(data) > 800:
             data = data[:800]
         return _ok(data)
@@ -437,20 +467,15 @@ def adj_factor_batch(request: BatchRequest):
     client = _get_client()
     start_s = _date_text(request.start_time)
     end_s = _date_text(request.end_time)
-    data: list[dict[str, Any]] = []
-    failed: list[str] = []
-    for symbol in request.symbols:
-        try:
-            params: dict[str, Any] = {"ts_code": _normalize_code(symbol)}
-            if start_s:
-                params["start"] = start_s
-            if end_s:
-                params["end"] = end_s
-            result = client.adj_factor(**params)
-            data.extend(_normalize(result))
-        except Exception as exc:
-            failed.append(symbol)
-            logger.warning("adj_factor failed for %s: %s", symbol, exc)
+    def fetch_one(symbol: str) -> list[dict[str, Any]]:
+        params: dict[str, Any] = {"ts_code": _normalize_code(symbol)}
+        if start_s:
+            params["start"] = start_s
+        if end_s:
+            params["end"] = end_s
+        return _normalize(client.adj_factor(**params))
+
+    data, failed = _run_parallel(request.symbols, fetch_one)
     return _batch_error(request.symbols, failed) or _ok(data)
 
 
@@ -480,30 +505,31 @@ def adj_factor(
 def financial_batch(request: FinancialRequest):
     """批量财务报表；report_type 透传给上游，上游不支持时自动降级。"""
     client = _get_client()
-    data: list[dict[str, Any]] = []
-    failed: list[str] = []
-    for symbol in request.symbols:
+    # 首次降级后记住该 report_type 不被上游支持，后续标的直接走全量查询，
+    # 避免每个标的都先失败一次再降级。
+    report_type_unsupported = False
+
+    def fetch_one(symbol: str) -> list[dict[str, Any]]:
+        nonlocal report_type_unsupported
+        params: dict[str, Any] = {"stock": _normalize_code(symbol)}
+        if request.report_type and not report_type_unsupported:
+            params["report_type"] = request.report_type
         try:
-            params: dict[str, Any] = {"stock": _normalize_code(symbol)}
-            if request.report_type:
-                params["report_type"] = request.report_type
-            try:
-                result = client.call("stock_financial_report_sina", **params)
-            except Exception as report_type_exc:
-                if not request.report_type:
-                    raise
-                # 上游接口不接受 report_type 参数或该报表类型不可用时，
-                # 降级为不带 report_type 的全量查询
-                logger.warning(
-                    "financial report_type=%s failed for %s (%s), fallback to full query",
-                    request.report_type, symbol, report_type_exc,
-                )
-                params.pop("report_type", None)
-                result = client.call("stock_financial_report_sina", **params)
-            data.extend(_normalize(result))
-        except Exception as exc:
-            failed.append(symbol)
-            logger.warning("financial failed for %s: %s", symbol, exc)
+            return _normalize(client.call("stock_financial_report_sina", **params))
+        except Exception as report_type_exc:
+            if not request.report_type or report_type_unsupported:
+                raise
+            # 上游接口不接受 report_type 参数或该报表类型不可用时，
+            # 降级为不带 report_type 的全量查询
+            logger.warning(
+                "financial report_type=%s failed for %s (%s), fallback to full query",
+                request.report_type, symbol, report_type_exc,
+            )
+            report_type_unsupported = True
+            params.pop("report_type", None)
+            return _normalize(client.call("stock_financial_report_sina", **params))
+
+    data, failed = _run_parallel(request.symbols, fetch_one)
     return _batch_error(request.symbols, failed) or _ok(data)
 
 
@@ -530,45 +556,42 @@ def financial(
 def depth5_batch(request: BatchRequest):
     """批量盘口：AxData 快照仅含买一/卖一档。"""
     client = _get_client()
-    data: list[dict[str, Any]] = []
-    failed: list[str] = []
-    for symbol in request.symbols:
-        try:
-            snapshot = client.call(
-                "stock_realtime_snapshot_tdx",
-                code=_normalize_code(symbol),
-                fields=[
-                    "instrument_id",
-                    "bid1_price",
-                    "bid1_volume",
-                    "ask1_price",
-                    "ask1_volume",
+
+    def fetch_one(symbol: str) -> list[dict[str, Any]]:
+        snapshot = client.call(
+            "stock_realtime_snapshot_tdx",
+            code=_normalize_code(symbol),
+            fields=[
+                "instrument_id",
+                "bid1_price",
+                "bid1_volume",
+                "ask1_price",
+                "ask1_volume",
+            ],
+        )
+        rows = _normalize(snapshot)
+        if not rows:
+            return []
+        row = rows[0]
+        return [
+            {
+                "symbol": symbol,
+                "asks": [
+                    {
+                        "price": row.get("ask1_price"),
+                        "volume": row.get("ask1_volume"),
+                    },
                 ],
-            )
-            rows = _normalize(snapshot)
-            if not rows:
-                continue
-            row = rows[0]
-            data.append(
-                {
-                    "symbol": symbol,
-                    "asks": [
-                        {
-                            "price": row.get("ask1_price"),
-                            "volume": row.get("ask1_volume"),
-                        },
-                    ],
-                    "bids": [
-                        {
-                            "price": row.get("bid1_price"),
-                            "volume": row.get("bid1_volume"),
-                        },
-                    ],
-                }
-            )
-        except Exception as exc:
-            failed.append(symbol)
-            logger.warning("depth5 failed for %s: %s", symbol, exc)
+                "bids": [
+                    {
+                        "price": row.get("bid1_price"),
+                        "volume": row.get("bid1_volume"),
+                    },
+                ],
+            }
+        ]
+
+    data, failed = _run_parallel(request.symbols, fetch_one)
     return _batch_error(request.symbols, failed) or _ok(data)
 
 
@@ -617,7 +640,11 @@ def trade_cal(
     end: str | None = Query(None, description="截止日期"),
 ):
     try:
-        result = _get_client().trade_cal(exchange=exchange, start=start, end=end)
+        result = _get_client().trade_cal(
+            exchange=exchange,
+            start=_normalize_date(start) if start else None,
+            end=_normalize_date(end) if end else None,
+        )
         return _ok(_normalize(result))
     except Exception as e:
         logger.exception("tick adapter trade_cal failed")
