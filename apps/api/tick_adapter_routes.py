@@ -89,6 +89,19 @@ def _parse_fields(raw: str | None) -> list[str] | None:
     return [f.strip() for f in raw.split(",") if f.strip()]
 
 
+def _normalize_code(code: str) -> str:
+    """裸代码自动补全交易所后缀：6 开头 → .SH，其余 → .SZ。"""
+    if "." in code:
+        return code
+    return f"{code}.SH" if code.startswith("6") else f"{code}.SZ"
+
+
+def _normalize_date(value: str) -> str:
+    """兼容 YYYY-MM-DD / YYYYMMDD / YYYYMMDDHHMM，统一转为 YYYYMMDD。"""
+    v = value.replace("-", "").replace("/", "").strip()
+    return v[:8] if len(v) >= 8 else v
+
+
 # ── 健康检查 ─────────────────────────────────────────────────
 
 @router.get("/health")
@@ -143,7 +156,7 @@ async def daily(
     fields: str | None = Query(None, description="字段列表，逗号分隔"),
 ):
     try:
-        params: dict[str, Any] = {"ts_code": code}
+        params: dict[str, Any] = {"ts_code": _normalize_code(code)}
         if start:
             params["start"] = start
         if end:
@@ -182,8 +195,8 @@ async def minute(
     try:
         # 从 code 中提取 symbol（去除后缀如 .SZ/.SH）
         symbol = code.split(".")[0] if "." in code else code
-        # 从 start 中提取日期部分 YYYYMMDD
-        date_str = start[:8] if len(start) >= 8 else start
+        # 兼容 YYYY-MM-DD / YYYYMMDD / YYYYMMDDHHMM，统一转为 YYYYMMDD
+        date_str = _normalize_date(start)
         # 使用 sina 分时数据接口
         result = _get_client().call(
             "stock_intraday_sina",
@@ -208,7 +221,7 @@ async def adj_factor(
     end: str | None = Query(None, description="截止日期"),
 ):
     try:
-        params: dict[str, Any] = {"ts_code": code}
+        params: dict[str, Any] = {"ts_code": _normalize_code(code)}
         if start:
             params["start"] = start
         if end:
