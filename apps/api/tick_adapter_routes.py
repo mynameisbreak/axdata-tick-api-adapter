@@ -104,6 +104,40 @@ def _parse_fields(raw: str | None) -> list[str] | None:
     return [f.strip() for f in raw.split(",") if f.strip()]
 
 
+def _is_index_code(code: str) -> bool:
+    """判断是否为指数代码：000xxx.SH 或 399xxx.SZ。"""
+    bare, _, suffix = code.partition(".")
+    if suffix == "SH" and bare.startswith("000"):
+        return True
+    if suffix == "SZ" and bare.startswith("399"):
+        return True
+    return False
+
+
+def _fetch_index_daily(client: Any, symbol: str, start_s: str | None, end_s: str | None) -> list[dict[str, Any]]:
+    """通过 index_kline_tdx 接口获取指数日K，转换为 daily 格式。"""
+    result = client.call("index_kline_tdx", code=_normalize_code(symbol), period="day", count=800)
+    rows = _normalize(result)
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        trade_date = str(r.get("trade_time", ""))[:10].replace("-", "")
+        if start_s and trade_date < start_s:
+            continue
+        if end_s and trade_date > end_s:
+            continue
+        out.append({
+            "ts_code": r.get("instrument_id", symbol),
+            "trade_date": trade_date,
+            "open": r.get("open"),
+            "high": r.get("high"),
+            "low": r.get("low"),
+            "close": r.get("close"),
+            "vol": r.get("volume"),
+            "amount": r.get("amount"),
+        })
+    return out
+
+
 def _normalize_code(code: str) -> str:
     if "." in code:
         return code
@@ -277,6 +311,8 @@ def daily_batch(request: BatchRequest):
     end_s = _date_text(request.end_time)
 
     def fetch_one(symbol: str) -> list[dict[str, Any]]:
+        if _is_index_code(symbol):
+            return _fetch_index_daily(client, symbol, start_s, end_s)
         params: dict[str, Any] = {
             "ts_code": _normalize_code(symbol),
             "fields": _DAILY_FIELDS,
