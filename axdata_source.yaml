@@ -1,0 +1,121 @@
+# tick-stock-panel 自定义数据源配置文件
+# 规范参考: https://github.com/shy3130/tick-stock-panel/blob/main/docs/custom-data-source.md
+# 用法: 放到 tick-stock-panel 的 data/data_sources/ 目录，在设置页点击重新加载
+# 注意: 将 host 替换为实际部署 AxData API 的服务器地址
+
+name: axdata_source
+display_name: "AxData tick adapter（axdata-tick-api-adapter）"
+auth:
+  type: none
+
+datasets:
+  realtime:
+    url: http://host.docker.internal:8666/tick/realtime
+    method: GET
+    rpm: 60
+    timeout: 60
+    response_path: data
+    pct_unit: percent
+    field_map:
+      symbol: symbol
+      last_price: last_price
+      pre_close: prev_close
+      open: open
+      high: high
+      low: low
+      volume: volume
+      amount: amount
+      change_pct: change_pct
+
+  daily:
+    url: http://host.docker.internal:8666/tick/daily
+    method: POST
+    batch: 50
+    rpm: 30
+    timeout: 60
+    response_path: data
+    field_map:
+      ts_code: symbol
+      trade_date: date
+      open: open
+      high: high
+      low: low
+      close: close
+      vol: volume
+      amount: amount
+    transforms:
+      date: "parse_date(value, '%Y%m%d')"
+
+  adj_factor:
+    url: http://host.docker.internal:8666/tick/adj_factor
+    method: POST
+    batch: 75
+    rpm: 30
+    timeout: 60
+    response_path: data
+    field_map:
+      ts_code: symbol
+      trade_date: trade_date
+      adj_factor: ex_factor
+    transforms:
+      trade_date: "parse_date(value, '%Y%m%d')"
+
+  minute:
+    url: http://host.docker.internal:8666/tick/minute
+    method: POST
+    batch: 20
+    rpm: 60
+    timeout: 60
+    response_path: data
+    field_map:
+      symbol: symbol
+      datetime: datetime
+      open: open
+      high: high
+      low: low
+      close: close
+      volume: volume
+      amount: amount
+
+  full_minute:
+    url: http://host.docker.internal:8666/tick/full_minute
+    method: POST
+    rpm: 30
+    timeout: 60
+    response_path: data
+    field_map:
+      symbol: symbol
+      datetime: datetime
+      open: open
+      high: high
+      low: low
+      close: close
+      volume: volume
+      amount: amount
+
+  financial:
+    url: http://host.docker.internal:8666/tick/financial
+    method: POST
+    batch: 20
+    rpm: 10
+    timeout: 60
+    response_path: data
+    field_map:
+      instrument_id: symbol
+      statement_type: statement_type
+      statement_name: statement_name
+      report_date: report_date
+      item_name: item_name
+      item_value: item_value
+
+  depth5:
+    url: http://host.docker.internal:8666/tick/depth5
+    method: POST
+    batch: 75
+    rpm: 30
+    timeout: 60
+    response_path: data
+    field_map:
+      symbol: symbol
+      asks: asks
+      bids: bids
