@@ -60,6 +60,11 @@ curl -X POST http://127.0.0.1:3018/api/settings/data-sources/reload
    → 服务器到 github.com 网络间歇性中断，用循环重试: for i in 1..6; do timeout 30 git push origin main && break; sleep 10; done。
 5. 面板数据为空但端点正常:
    → AxData 数据目录仅样本数据时属预期；分钟线依赖 stock_intraday_sina 数据源，需确认已启用。
+6. /tick/health 返回 {"detail":"Not Found"}（HTTP 404）:
+   → 响应方不是本项目的 API，而是另一个占着 8666 端口的 FastAPI 服务（最常见：上游 electkismet/AxData 的 API，它有 /health 但没有 /tick/*）。本项目 uvicorn 启动时会报 address already in use 并退出，该报错容易被忽略，之后 curl/面板测试打到的都是旧服务。
+   → 判别: curl http://127.0.0.1:8666/health 返回 200 但 /tick/health 返回 404，即可确认端口被其它服务占用。
+   → 修复: Linux/macOS 用 ss -tlnp | grep 8666（Windows 用 netstat -ano | findstr 8666）找到占用进程并停止后重新启动本项目；或改用其它端口启动并同步修改 tick-stock-panel.yaml 中的 URL。
+   → 另外检查 URL 端口是否写错（如误写成面板后端的 3018），端口错误会得到同样的 404。
 ```
 
 ## 校验规则速查（对齐面板 _REQUIRED）
