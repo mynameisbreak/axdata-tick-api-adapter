@@ -46,6 +46,37 @@ curl http://127.0.0.1:8666/tick/health
 # {"status":"ok","backend":"axdata-sdk","provider":"axdata-tick-adapter"}
 ```
 
+### AI 辅助部署提示词
+
+将下方整段提示词复制给你的 AI 编程助手（Trae / Claude Code / Cursor 等），即可自动完成部署与验证；完整步骤与故障判定见 [`docs/deploy-ai-prompt.md`](./docs/deploy-ai-prompt.md)。
+
+```text
+请帮我部署 axdata-tick-api-adapter（AxData tick 行情适配器），严格按以下步骤执行：
+
+1. 环境准备：Python 3.11+（Windows 用 py -3.11）。安装依赖：
+   python3 -m pip install -e ".[dev]"
+   python3 -m pip install -e "libs/axdata_core[cli]"
+2. 启动 API（端口 8666，含 /tick/* 路由），并保持后台常驻：
+   nohup python3 -m uvicorn apps.api.main:app --host 0.0.0.0 --port 8666 > /tmp/axdata-api.log 2>&1 &
+   Windows PowerShell 用：Start-Process -WindowStyle Hidden -FilePath py -ArgumentList "-3.11","-m","uvicorn","apps.api.main:app","--host","0.0.0.0","--port","8666"
+3. 验证（必须实际执行 curl 并确认返回，不要跳过）：
+   curl http://127.0.0.1:8666/tick/health
+   预期返回：{"status":"ok","backend":"axdata-sdk","provider":"axdata-tick-adapter"}
+4. 若 /tick/health 返回 {"detail":"Not Found"}，说明 8666 端口被其它服务占用
+   （uvicorn 启动时会报 address already in use 并退出，该报错容易被忽略）。
+   用 ss -tlnp | grep 8666（Windows: netstat -ano | findstr 8666）找到占用进程，
+   停掉后重新启动本项目，或改用其它端口并同步修改 tick-stock-panel.yaml 的 url。
+5. 如需接入 tick-stock-panel：仅当面板 data/data_sources/axdata_source.yaml 不存在时，
+   才将本仓库 tick-stock-panel.yaml 复制为该文件（已存在则不得覆盖，其中是用户定制的 URL/auth），
+   并把 url 的 host 替换为实际部署地址。
+   注意：面板在 Linux Docker 中运行时，host 不能用 localhost 或 host.docker.internal，
+   要用宿主机实际 IP（如 192.168.x.x）；升级面板或重新部署本项目时均不得覆盖已有
+   axdata_source.yaml，升级后 diff 备份核对未被重置。
+6. 数据目录为 data_root 下的 data/（默认取本仓库 data/）；仅有样本数据时面板显示有限属预期。
+7. 部署完成后输出各项验证命令的实际结果，未验证通过前不要宣布完成。
+更多判定规则见 docs/deploy-ai-prompt.md 的【故障判定】章节。
+```
+
 ### tick-stock-panel 自定义数据源配置
 
 本仓库提供 [`tick-stock-panel.yaml`](./tick-stock-panel.yaml)，符合 [tick-stock-panel 自定义数据源规范](https://github.com/shy3130/tick-stock-panel/blob/main/docs/custom-data-source.md)。接口形态对齐 [eltdx-tick-adapter](https://github.com/mynameisbreak/eltdx-tick-adapter)：`realtime` 为 GET 全市场快照，其余为 POST 批量端点（`symbols` + `start_time`/`end_time`）。

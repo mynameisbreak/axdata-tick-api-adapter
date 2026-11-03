@@ -32,8 +32,13 @@ python3 scripts/validate_panel_config.py tick-stock-panel.yaml
 注意: 校验失败的源会被面板静默排除（不出现在数据源列表），必须先修复再部署。
 
 【步骤 4：部署配置到面板】
-cp tick-stock-panel.yaml <tick-stock-panel 项目>/data/data_sources/axdata_source.yaml
-（目录为 root 所有时需 sudo cp；Docker 部署时确认容器挂载为 /app/data 而非容器内部路径）
+[ -f <tick-stock-panel 项目>/data/data_sources/axdata_source.yaml ] || cp tick-stock-panel.yaml <tick-stock-panel 项目>/data/data_sources/axdata_source.yaml
+（已存在时不得覆盖——文件内是用户定制过的 URL/auth，无条件覆盖即"配置被重置"故障的根因；此时只做校验、不写入。目录为 root 所有时需 sudo；Docker 部署时确认容器挂载为 /app/data 而非容器内部路径）
+
+【升级注意】
+升级面板（git pull + docker compose up --build -d）或重新执行本部署流程时，升级流程不得覆盖已有数据源配置 data/data_sources/axdata_source.yaml。
+升级前备份: cp <目标>/axdata_source.yaml /tmp/axdata_source.yaml.bak
+升级后核对: diff <目标>/axdata_source.yaml /tmp/axdata_source.yaml.bak 应无差异；若被重置，从备份恢复并执行步骤 5 重新加载。
 
 【步骤 5：触发面板重新加载】
 在面板 Web 界面『设置 → 数据源』点击『重新加载』，或:
